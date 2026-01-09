@@ -68,7 +68,6 @@ def parse_args() -> argparse.Namespace:
     p.add_argument('-t', '--flow-start', type=int, default=0,
                    help='Unix timestamp of first flow start (for rel_time). Default 0')
     p.add_argument('-s', '--stats-flowid', help='Filter by flowid (hex like 0xc173985d; hex only)')
-    p.add_argument('-o', '--out', help='Optional TSV output path similar to C writer')
     p.add_argument('--verbose', action='store_true', help='Verbose output')
     return p.parse_args()
 
@@ -104,6 +103,15 @@ def detect_rec_fmt(path: str) -> str:
         if field.startswith('rec_fmt='):
             return field.split('=', 1)[1].strip().lower()
     raise ValueError("rec_fmt key not found in the first line of the log")
+
+
+def make_output_name(flowid: int, rec_fmt: str) -> str:
+    """
+    Generate output filename:
+      plot_<flowid>.<bin|txt>.data
+    """
+    fmt = 'bin' if rec_fmt == 'binary' else 'txt'
+    return f"plot_{flowid:08x}.{fmt}.data"
 
 
 def read_last_line(path: str, chunk_size: int = 4096) -> str:
@@ -360,12 +368,13 @@ def main() -> int:
         else iter_text_records(args.file, args.flow_start, flowid)
     )
 
-    if args.out:
-        write_tsv(args.out, rec_iter)
+    if flowid is not None:
+        out_name = make_output_name(flowid, fmt)
+        write_tsv(out_name, rec_iter)
         if args.verbose:
-            print(f"Wrote TSV to: {args.out}")
+            print(f"Wrote TSV to: {out_name}")
     else:
-        # Default: print a few sample records to stdout
+        # No flowid → just sample output
         print('Sample records:')
         count = 0
         for r in rec_iter:
