@@ -7,8 +7,7 @@ A lightweight Python 3 script that mirrors the core behavior of review_siftr2_lo
 
 It also offers optional conveniences:
 - Detects text vs binary body (very basic heuristic)
-- Optional filtering by flowid (hex or decimal)
-- Optional TSV output similar to the C writer thread
+- Optional filtering by flowid (hex) and output its TSV data
 
 This script does not depend on project headers. It aims to be self-contained and
 portable. Adjust parsing logic to match the exact siftr2.5 fields if needed.
