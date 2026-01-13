@@ -61,13 +61,60 @@ PKT_NODE_STRUCT = struct.Struct(
 )
 
 
+STACK_TYPE = {
+    0: "fbsd",
+    1: "rack",
+}
+
+
+TCP_CC = {
+    0: "CUBIC",
+    1: "newreno",
+    2: "bbr",
+}
+
+
+@dataclass
+class FlowMeta:
+    flowid: int
+    ipver: int
+    laddr: str
+    lport: int
+    faddr: str
+    fport: int
+    stack: int
+    tcp_cc: int
+    mss: int
+    sack: int
+    snd_scale: int
+    rcv_scale: int
+    nrecord: int
+    ntrans: int
+
+
+def parse_kv_fields(line: str) -> dict[str, str]:
+    kv = {}
+    for field in line.strip().split('\t'):
+        if '=' in field:
+            k, v = field.split('=', 1)
+            kv[k] = v
+    return kv
+
+
+def format_time(secs: int, usecs: int) -> tuple[str, float]:
+    epoch = secs + usecs / 1_000_000
+    tm = time.localtime(secs)
+    human = time.strftime('%Y-%m-%d %H:%M:%S', tm)
+    return f"{human}.{usecs:06d}", epoch
+
+
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description='Read siftr2.5 log: first line, body, last line.')
     p.add_argument('-f', '--file', required=True, help='Path to siftr2.5 log file')
     p.add_argument('-t', '--flow-start', type=int, default=0,
                    help='Unix timestamp of first flow start (for rel_time). Default 0')
     p.add_argument('-s', '--stats-flowid', help='Filter by flowid (hex like 0xc173985d; hex only)')
-    p.add_argument('--verbose', action='store_true', help='Verbose output')
+    p.add_argument('-v', '--verbose', action='store_true', help='Verbose output')
     return p.parse_args()
 
 
@@ -138,6 +185,64 @@ def read_last_line(path: str, chunk_size: int = 4096) -> str:
                 parts = (block + leftover).splitlines()
                 return parts[-1].decode('utf-8', errors='replace') if parts else ''
             leftover = block + leftover
+
+
+def parse_flow_list(footer: str) -> list[FlowMeta]:
+    flows: list[FlowMeta] = []
+
+    for field in footer.split('\t'):
+        if not field.startswith('flow_list='):
+            continue
+
+        payload = field.split('=', 1)[1]
+        for entry in payload.split(';'):
+            if not entry:
+                continue
+
+            parts = entry.split(',')
+            if len(parts) != 14:
+                continue
+
+            flows.append(
+                FlowMeta(
+                    flowid=int(parts[0], 16),
+                    ipver=int(parts[1]),
+                    laddr=parts[2],
+                    lport=int(parts[3]),
+                    faddr=parts[4],
+                    fport=int(parts[5]),
+                    stack=int(parts[6]),
+                    tcp_cc=int(parts[7]),
+                    mss=int(parts[8]),
+                    sack=int(parts[9]),
+                    snd_scale=int(parts[10]),
+                    rcv_scale=int(parts[11]),
+                    nrecord=int(parts[12]),
+                    ntrans=int(parts[13]),
+                )
+            )
+
+    return flows
+
+
+def dump_flow_list(flows: list[FlowMeta]) -> None:
+    if not flows:
+        return
+
+    print("flow id list:")
+    for f in flows:
+        ip = "IPv6" if f.ipver == 6 else "IPv4"
+        stack = STACK_TYPE.get(f.stack, str(f.stack))
+        cc = TCP_CC.get(f.tcp_cc, str(f.tcp_cc)).upper()
+
+        print(
+            f" id:{f.flowid:08x} {ip} "
+            f"({f.laddr}:{f.lport}<->{f.faddr}:{f.fport}) "
+            f"stack:{stack} tcp_cc:{cc} "
+            f"mss:{f.mss} SACK:{f.sack} "
+            f"snd/rcv_scal:{f.snd_scale}/{f.rcv_scale} "
+            f"cnt:{f.nrecord}/{f.ntrans}"
+        )
 
 
 def get_footer_and_record_size(path: str) -> Tuple[int, int]:
@@ -344,22 +449,57 @@ def main() -> int:
 
     # First line (header)
     first_line = read_first_line(args.file)
-    print('First line:')
-    print(first_line.rstrip('\n'))
+    if args.verbose:
+        print('First line:')
+        print(first_line.rstrip('\n'))
 
     # Last line
     last_line = read_last_line(args.file)
-    print('Last line:')
-    print(last_line)
+    if args.verbose:
+        print('Last line:')
+        print(last_line)
 
+    first_kv = parse_kv_fields(first_line)
+    last_kv = parse_kv_fields(last_line)
+
+    # ---- Header-style output (always shown, like C tool) ----
+    print(f"input file name: {os.path.basename(args.file)}")
+
+    siftrver = first_kv.get('siftrver', 'unknown')
+    print(f"siftr version: {siftrver}")
+
+    # ---- detect record format ----
     try:
         fmt = detect_rec_fmt(args.file)
     except ValueError as e:
         print(f"Error: {e}")
         return 1
-
     if args.verbose:
-        print(f'Detected body format: {fmt}')
+        print(f'Detected record format: {fmt}')
+
+    # ---- Flow list ----
+    flows = parse_flow_list(last_line)
+    dump_flow_list(flows)
+
+    # ---- Time info ----
+    try:
+        start_secs = int(first_kv['enable_time_secs'])
+        start_usecs = int(first_kv['enable_time_usecs'])
+        end_secs = int(last_kv['disable_time_secs'])
+        end_usecs = int(last_kv['disable_time_usecs'])
+    except KeyError as e:
+        print(f"Error: missing timestamp field {e}")
+        return 1
+
+    start_str, start_epoch = format_time(start_secs, start_usecs)
+    end_str, end_epoch = format_time(end_secs, end_usecs)
+    duration = end_epoch - start_epoch
+
+    print()
+    print(f"starting_time: {start_str} ({start_epoch:.6f})")
+    print(f"ending_time:   {end_str} ({end_epoch:.6f})")
+    print(f"log duration: {duration:.2f} seconds")
+    print()
 
     rec_iter = (
         iter_binary_records(args.file, args.flow_start, flowid)
@@ -372,15 +512,6 @@ def main() -> int:
         write_tsv(out_name, rec_iter)
         if args.verbose:
             print(f"Wrote TSV to: {out_name}")
-    else:
-        # No flowid → just sample output
-        print('Sample records:')
-        count = 0
-        for r in rec_iter:
-            print(r)
-            count += 1
-            if count >= 10:
-                break
 
     # Print execution time
     elapsed = time.perf_counter() - start_time
