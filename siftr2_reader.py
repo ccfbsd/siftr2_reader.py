@@ -342,6 +342,19 @@ def iter_text_records(path: str, first_flow_start: int, flowid: Optional[int]) -
             )
 
 
+def _unpack_pkt_node(chunk: bytes):
+    fields = PKT_NODE_STRUCT.unpack(chunk)
+    return (
+        fields[0],  # flowid
+        fields[1],  # direction
+        fields[2],  # tval
+        fields[3],  # snd_cwnd
+        fields[4],  # snd_ssthresh
+        fields[5],  # srtt
+        fields[6],  # data_sz
+    )
+
+
 def iter_binary_records(path: str, first_flow_start: int, flowid: Optional[int]) -> Iterator[Record]:
     # Determine boundaries and record size from header/footer
     hdr_end = header_end_offset(path)
@@ -379,19 +392,6 @@ def iter_binary_records(path: str, first_flow_start: int, flowid: Optional[int])
                 srtt=int(srtt),
                 data_sz=int(data_sz),
             )
-
-
-def _unpack_pkt_node(chunk: bytes):
-    fields = PKT_NODE_STRUCT.unpack(chunk)
-    return (
-        fields[0],  # flowid
-        fields[1],  # direction
-        fields[2],  # tval
-        fields[3],  # snd_cwnd
-        fields[4],  # snd_ssthresh
-        fields[5],  # srtt
-        fields[6],  # data_sz
-    )
 
 
 def write_tsv(out_path: str, recs: Iterator[Record]) -> None:
