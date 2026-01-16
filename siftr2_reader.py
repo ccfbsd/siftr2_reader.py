@@ -61,19 +61,6 @@ PKT_NODE_STRUCT = struct.Struct(
 )
 
 
-STACK_TYPE = {
-    0: "fbsd",
-    1: "rack",
-}
-
-
-TCP_CC = {
-    0: "CUBIC",
-    1: "newreno",
-    2: "bbr",
-}
-
-
 @dataclass
 class FlowMeta:
     flowid: int
@@ -82,8 +69,8 @@ class FlowMeta:
     lport: int
     faddr: str
     fport: int
-    stack: int
-    tcp_cc: int
+    stack: str
+    tcp_cc: str
     mss: int
     sack: int
     snd_scale: int
@@ -151,15 +138,6 @@ def detect_rec_fmt(path: str) -> str:
     raise ValueError("rec_fmt key not found in the first line of the log")
 
 
-def make_output_name(flowid: int, rec_fmt: str) -> str:
-    """
-    Generate output filename:
-      plot_<flowid>.<bin|txt>.data
-    """
-    fmt = 'bin' if rec_fmt == 'binary' else 'txt'
-    return f"plot_{flowid:08x}.{fmt}.data"
-
-
 def read_last_line(path: str, chunk_size: int = 4096) -> str:
     # Efficiently read last line without loading entire file
     file_size = os.path.getsize(path)
@@ -211,8 +189,8 @@ def parse_flow_list(footer: str) -> list[FlowMeta]:
                     lport=int(parts[3]),
                     faddr=parts[4],
                     fport=int(parts[5]),
-                    stack=int(parts[6]),
-                    tcp_cc=int(parts[7]),
+                    stack=parts[6],
+                    tcp_cc=parts[7],
                     mss=int(parts[8]),
                     sack=int(parts[9]),
                     snd_scale=int(parts[10]),
@@ -232,13 +210,11 @@ def dump_flow_list(flows: list[FlowMeta]) -> None:
     print("flow id list:")
     for f in flows:
         ip = "IPv6" if f.ipver == 6 else "IPv4"
-        stack = STACK_TYPE.get(f.stack, str(f.stack))
-        cc = TCP_CC.get(f.tcp_cc, str(f.tcp_cc)).upper()
 
         print(
             f" id:{f.flowid:08x} {ip} "
             f"({f.laddr}:{f.lport}<->{f.faddr}:{f.fport}) "
-            f"stack:{stack} tcp_cc:{cc} "
+            f"stack:{f.stack} tcp_cc:{f.tcp_cc} "
             f"mss:{f.mss} SACK:{f.sack} "
             f"snd/rcv_scal:{f.snd_scale}/{f.rcv_scale} "
             f"cnt:{f.nrecord}/{f.ntrans}"
@@ -508,7 +484,8 @@ def main() -> int:
     )
 
     if flowid is not None:
-        out_name = make_output_name(flowid, fmt)
+        # output filename
+        out_name = f"plot_{flowid:08x}.data"
         write_tsv(out_name, rec_iter)
         if args.verbose:
             print(f"Wrote TSV to: {out_name}")
