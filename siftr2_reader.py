@@ -209,10 +209,10 @@ def dump_flow_list(flows: list[FlowMeta]) -> None:
 
     print("flow id list:")
     for f in flows:
-        ip = "IPv6" if f.ipver == 6 else "IPv4"
+        ipv = "IPv6" if f.ipver == 6 else "IPv4"
 
         print(
-            f" id:{f.flowid:08x} {ip} "
+            f" id:{f.flowid:08x} {ipv} "
             f"({f.laddr}:{f.lport}<->{f.faddr}:{f.fport}) "
             f"stack:{f.stack} tcp_cc:{f.tcp_cc} "
             f"mss:{f.mss} SACK:{f.sack} "
