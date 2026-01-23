@@ -181,8 +181,6 @@ def format_time(secs: int, usecs: int) -> tuple[str, float]:
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description='Read siftr2.5 log: first line, body, last line.')
     p.add_argument('-f', '--file', required=True, help='Path to siftr2.5 log file')
-    p.add_argument('-t', '--flow-start', type=int, default=0,
-                   help='Unix timestamp of first flow start (for rel_time). Default 0')
     p.add_argument('-s', '--stats-flowid', help='Filter by flowid (hex like c173985d or 0xc173985d; hex only)')
     p.add_argument('-v', '--verbose', action='store_true', help='Verbose output')
     return p.parse_args()
