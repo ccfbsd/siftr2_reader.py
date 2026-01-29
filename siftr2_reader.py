@@ -16,7 +16,6 @@ portable. Adjust parsing logic to match the exact siftr2.5 fields if needed.
 from __future__ import annotations
 import argparse
 import os
-import sys
 import struct
 import time
 from dataclasses import dataclass
@@ -109,13 +108,6 @@ class FlowStats:
               f"({self.rec_out} outputs, {self.rec_in} inputs)")
 
 
-# file-level stats
-@dataclass
-class FileStats:
-    total_records: int = 0
-    total_flows: int = 0
-
-
 # This struct definition is an assumption based on the C snippet's usage.
 # Adjust the format string to match the real binary layout of your pkt_node.
 # Example fields: flowid (u32), direction (u8), tval (u32), snd_cwnd (u32),
@@ -123,8 +115,7 @@ class FileStats:
 PKT_NODE_STRUCT = struct.Struct(
     '<'     # little endian
     'I'     # flowid
-    'B'     # direction
-    '3x'    # padding
+    'I'     # direction
     'I'     # tval
     'I'     # snd_cwnd
     'I'     # snd_ssthresh
@@ -225,13 +216,11 @@ def read_last_line(path: str, chunk_size: int = 4096) -> str:
     if file_size == 0:
         return ''
     with open(path, 'rb') as f:
-        # Start from the end and search backwards for a newline
         offset = 0
         leftover = b''
         while True:
             read_size = min(chunk_size, file_size - offset)
             if read_size <= 0:
-                # Reached beginning; return whatever we have
                 data = f.read()
                 if not data:
                     return leftover.decode('utf-8', errors='replace')
@@ -307,30 +296,37 @@ def get_footer_and_record_size(path: str) -> Tuple[int, int]:
     Return a tuple (footer_offset, record_size_bytes). The footer_offset is the
     byte offset where the final ASCII line begins. The record_size_bytes is
     parsed from the footer's key `record_size=`; raises ValueError if missing.
+
+    This implementation scans from file end backward in chunks for efficiency.
     """
-    with open(path, 'rb') as f:
-        data = f.read()
-
     marker = b'disable_time_secs='
-    idx = data.rfind(marker)
-    if idx < 0:
+    chunk_size = 4096
+    file_size = os.path.getsize(path)
+    with open(path, 'rb') as f:
+        offset = 0
+        buffer = b''
+        while offset < file_size:
+            read_size = min(chunk_size, file_size - offset)
+            offset += read_size
+            f.seek(file_size - offset)
+            chunk = f.read(read_size)
+            buffer = chunk + buffer
+            idx = buffer.find(marker)
+            if idx != -1:
+                footer_offset = file_size - offset + idx
+                footer = buffer[idx:].decode('utf-8', errors='replace').strip()
+                record_size = None
+                for field in footer.split('\t'):
+                    if field.startswith('record_size='):
+                        try:
+                            record_size = int(field.split('=', 1)[1])
+                        except ValueError:
+                            pass
+                        break
+                if record_size is None:
+                    raise ValueError('record_size key not found or invalid in footer')
+                return footer_offset, record_size
         raise ValueError('Footer marker not found')
-
-    footer = data[idx:].decode('utf-8', errors='replace').strip()
-
-    record_size = None
-    for field in footer.split('\t'):
-        if field.startswith('record_size='):
-            try:
-                record_size = int(field.split('=', 1)[1])
-            except ValueError:
-                pass
-            break
-
-    if record_size is None:
-        raise ValueError('record_size key not found or invalid in footer')
-
-    return idx, record_size
 
 
 def header_end_offset(path: str) -> int:
@@ -348,9 +344,7 @@ def iter_text_records(path: str, first_tval: int, flowid: Optional[int]) -> Iter
     corresponding to struct pkt_node in C.
     """
     with open(path, 'r', encoding='utf-8', errors='replace') as f:
-        # Read and discard the header line (starts with enable_time_secs=)
-        _ = f.readline()
-        # Iterate through body lines until footer (starts with disable_time_secs=)
+        _ = f.readline()  # discard header line
         for raw in f:
             line = raw.strip()
             if not line:
@@ -358,39 +352,24 @@ def iter_text_records(path: str, first_tval: int, flowid: Optional[int]) -> Iter
             if line.startswith('disable_time_secs='):
                 break
             if line.startswith('enable_time_secs='):
-                # In case there are multiple segments, skip headers
                 continue
             parts = line.split(',')
             if len(parts) != 18:
-                # Strict: require exactly 18 fields
                 continue
             try:
                 fid = int(parts[0], 16)
                 direction = parts[1].strip().lower()[:1]
-                # Parse all numeric fields as hex
                 tval = int(parts[2], 16)
                 snd_cwnd = int(parts[3], 16)
                 snd_ssthresh = int(parts[4], 16)
                 srtt = int(parts[5], 16)
                 data_sz = int(parts[6], 16)
-                # The rest are parsed to validate the line format (not used downstream yet)
-                _snd_wnd = int(parts[7], 16)
-                _rcv_wnd = int(parts[8], 16)
-                _t_flags = int(parts[9], 16)
-                _t_flags2 = int(parts[10], 16)
-                _rto = int(parts[11], 16)
-                _snd_buf_hiwater = int(parts[12], 16)
-                _snd_buf_cc = int(parts[13], 16)
-                _rcv_buf_hiwater = int(parts[14], 16)
-                _rcv_buf_cc = int(parts[15], 16)
-                _pipe = int(parts[16], 16)
-                _t_segqlen = int(parts[17], 16)
+                # Validate rest of the fields (not used downstream)
+                _ = [int(parts[i], 16) for i in range(7, 18)]
             except (ValueError, IndexError):
                 continue
 
-            # Flow filter: only after we've successfully parsed the line
             if flowid is not None and fid != flowid:
-                # If baseline not yet set, we still don't want to set it from a different flow
                 continue
             yield Record(
                 direction=direction,
@@ -416,21 +395,16 @@ def _unpack_pkt_node(chunk: bytes):
 
 
 def iter_binary_records(path: str, first_tval: int, flowid: Optional[int]) -> Iterator[Record]:
-    # Determine boundaries and record size from header/footer
     hdr_end = header_end_offset(path)
     try:
         footer_off, rec_size = get_footer_and_record_size(path)
-    except ValueError as e:
-        raise
-    # Sanity: ensure our assumed struct size matches rec_size if we use struct unpack
+    except ValueError:
+        return
     if PKT_NODE_STRUCT.size != rec_size:
-        # We can still read rec_size chunks, but unpacking may fail; warn via exception
         raise ValueError(f"Configured struct size ({PKT_NODE_STRUCT.size}) != record_size ({rec_size})")
 
     with open(path, 'rb') as f:
-        # Seek to start of binary body (right after header line)
         f.seek(hdr_end)
-        # Read fixed-size records up to (but not including) the footer
         while True:
             pos = f.tell()
             if pos + rec_size > footer_off:
@@ -439,15 +413,15 @@ def iter_binary_records(path: str, first_tval: int, flowid: Optional[int]) -> It
             if len(chunk) < rec_size:
                 break
             try:
-                (fid, direction_u8, tval, snd_cwnd, snd_ssthresh, srtt, data_sz) = _unpack_pkt_node(chunk)
+                fid, direction, tval, snd_cwnd, snd_ssthresh, srtt, data_sz = _unpack_pkt_node(chunk)
             except struct.error:
                 break
 
             if flowid is not None and fid != flowid:
                 continue
-            direction = 'i' if direction_u8 == 0 else 'o'
+            dir = 'i' if direction == 0 else 'o'
             yield Record(
-                direction=direction,
+                direction=dir,
                 rel_time=tval - first_tval,
                 cwnd=snd_cwnd,
                 ssthresh=snd_ssthresh,
@@ -468,28 +442,21 @@ def detect_first_tval(path: str, fmt: str) -> Optional[int]:
     if fmt in ('txt', 'text', 'ascii'):
         try:
             with open(path, 'r', encoding='utf-8', errors='replace') as f:
-                # Skip the first header line
-                _ = f.readline()
-                # The very next valid body line should be the first record
+                _ = f.readline()  # skip header line
                 for raw in f:
                     line = raw.strip()
                     if not line:
                         continue
                     if line.startswith('disable_time_secs='):
-                        # Reached footer; no records
                         return None
                     if line.startswith('enable_time_secs='):
-                        # In case logs have repeated headers, skip and continue
                         continue
                     parts = line.split(',')
                     if len(parts) != 18:
-                        # Not a valid record line; skip
                         continue
                     try:
-                        tval = int(parts[2], 16)
-                        return tval
+                        return int(parts[2], 16)
                     except (ValueError, IndexError):
-                        # Malformed; keep scanning in case of odd preamble lines
                         continue
         except OSError:
             return None
@@ -501,16 +468,14 @@ def detect_first_tval(path: str, fmt: str) -> Optional[int]:
             if PKT_NODE_STRUCT.size != rec_size:
                 return None
             with open(path, 'rb') as f:
-                # Position at the start of the binary body
                 f.seek(hdr_end)
-                # Ensure there's room for at least one record before the footer
                 if hdr_end + rec_size > footer_off:
                     return None
                 chunk = f.read(rec_size)
                 if len(chunk) < rec_size:
                     return None
                 try:
-                    (_fid, _direction_u8, tval, _snd_cwnd, _snd_ssthresh, _srtt, _data_sz) = _unpack_pkt_node(chunk)
+                    _, _, tval, _, _, _, _ = _unpack_pkt_node(chunk)
                 except struct.error:
                     return None
                 return int(tval)
@@ -524,26 +489,22 @@ def main() -> int:
     start_time = time.perf_counter()
     args = parse_args()
     flowid = to_flowid(args.stats_flowid)
-    output_line = None
 
     if args.verbose:
         print(f"verbose mode enabled")
         print(f"input file name: {os.path.basename(args.file)}")
 
-    # First line (header)
     first_line = read_first_line(args.file)
     if args.verbose:
         output_line = first_line.replace('\t', ', ')
         print(output_line.rstrip('\n'))
 
-    # Detect record format early for baseline printing
     try:
         fmt = detect_rec_fmt(args.file)
     except ValueError as e:
         print(f"Error: {e}")
         return 1
 
-    # If print detected baseline next to header
     first_tval = detect_first_tval(args.file, fmt)
     if first_tval is None:
         print(f"Error: first_tval is None")
@@ -551,7 +512,6 @@ def main() -> int:
     elif args.verbose:
         print(f"first flow start at: {first_tval/1_000.0:.3f}")
 
-    # Last line
     last_line = read_last_line(args.file)
     if args.verbose:
         output_line = last_line.replace('\t', ', ')
@@ -562,19 +522,15 @@ def main() -> int:
     first_kv = parse_kv_fields(first_line)
     last_kv = parse_kv_fields(last_line)
 
-    # ---- Header-style output (always shown, like C tool) ----
     siftrver = first_kv.get('siftrver', 'unknown')
     print(f"siftr version: {siftrver}")
 
-    # ---- detect record format (already detected above) ----
     if args.verbose:
         print(f'Detected record format: {fmt}')
 
-    # ---- Flow list ----
     flows = parse_flow_list(last_line)
     dump_flow_list(flows)
 
-    # ---- Time info ----
     try:
         start_secs = int(first_kv['enable_time_secs'])
         start_usecs = int(first_kv['enable_time_usecs'])
@@ -598,7 +554,6 @@ def main() -> int:
         flow_stats: Optional[FlowStats] = None
         this_flow_mss = 0
         this_flow_meta: Optional[FlowMeta] = None
-        # file_stats = FileStats()
 
         for f in flows:
             if f.flowid == flowid:
@@ -612,15 +567,12 @@ def main() -> int:
             else iter_text_records(args.file, first_tval, flowid)
         )
 
-        # output filename
         out_name = f"plot_{flowid:08x}.data"
-        # Stream: write TSV header and each record while updating stats
         with open(out_name, 'w', encoding='utf-8') as w:
             w.write('##direction\trelative_timestamp\tcwnd\tssthresh\tsrtt\tdata_size\n')
             for r in rec_iter:
                 if flow_stats is None:
                     flow_stats = FlowStats(flowid=flowid)
-                # write one TSV line matching C fprintf formatting
                 w.write(
                     f"{r.direction}\t"
                     f"{r.rel_time/1000.0:.3f}\t"
@@ -631,13 +583,12 @@ def main() -> int:
                 )
                 flow_stats.update(r, this_flow_mss)
 
-        # here the header and footer lines should be counted
         print(f"input file has total lines: {flow_stats.rec_total + 2}")
         print(f"plot_file_name: {out_name}")
         print("++++++++++++++++++++++++++++++ summary ++++++++++++++++++++++++++++")
         if flow_stats:
             flow_desc = None
-            if 'this_flow_meta' in locals() and this_flow_meta is not None:
+            if this_flow_meta is not None:
                 flow_desc = f"{this_flow_meta.laddr}:{this_flow_meta.lport}->{this_flow_meta.faddr}:{this_flow_meta.fport}"
             if flow_desc:
                 print(f"  {flow_desc} flowid: {flow_stats.flowid:08x}")
@@ -645,7 +596,6 @@ def main() -> int:
                 print(f"flowid: {flow_stats.flowid:08x}")
             flow_stats.dump()
 
-    # Print execution time
     elapsed = time.perf_counter() - start_time
     print(f"\nthis program execution time: {elapsed:.3f} seconds")
 
