@@ -199,40 +199,14 @@ def read_first_line(path: str) -> str:
     return first
 
 
-def detect_rec_fmt(path: str) -> str:
+def detect_rec_fmt(first_line: str) -> str:
     """Return 'binary' or 'txt' by inspecting the first line's rec_fmt=... field.
     Raises ValueError if the key is not present.
     """
-    first = read_first_line(path)
-    for field in first.strip().split('\t'):
+    for field in first_line.strip().split('\t'):
         if field.startswith('rec_fmt='):
             return field.split('=', 1)[1].strip().lower()
     raise ValueError("rec_fmt key not found in the first line of the log")
-
-
-def read_last_line(path: str, chunk_size: int = 4096) -> str:
-    # Efficiently read last line without loading entire file
-    file_size = os.path.getsize(path)
-    if file_size == 0:
-        return ''
-    with open(path, 'rb') as f:
-        offset = 0
-        leftover = b''
-        while True:
-            read_size = min(chunk_size, file_size - offset)
-            if read_size <= 0:
-                data = f.read()
-                if not data:
-                    return leftover.decode('utf-8', errors='replace')
-                lines = (data + leftover).splitlines()
-                return lines[-1].decode('utf-8', errors='replace') if lines else ''
-            offset += read_size
-            f.seek(file_size - offset)
-            block = f.read(read_size)
-            if b'\n' in block:
-                parts = (block + leftover).splitlines()
-                return parts[-1].decode('utf-8', errors='replace') if parts else ''
-            leftover = block + leftover
 
 
 def parse_flow_list(footer: str) -> list[FlowMeta]:
@@ -291,11 +265,12 @@ def dump_flow_list(flows: list[FlowMeta]) -> None:
         )
 
 
-def get_footer_and_record_size(path: str) -> Tuple[int, int]:
+def get_last_line_offset_and_record_size(path: str, fmt: str) -> Tuple[str, int, int]:
     """
-    Return a tuple (footer_offset, record_size_bytes). The footer_offset is the
-    byte offset where the final ASCII line begins. The record_size_bytes is
-    parsed from the footer's key `record_size=`; raises ValueError if missing.
+    Return a tuple (last_line, footer_offset, record_size_bytes).
+    The footer_offset is the byte offset where the final ASCII line begins.
+    The record_size_bytes is parsed from the footer's key `record_size=`;
+    raises ValueError if missing.
 
     This implementation scans from file end backward in chunks for efficiency.
     """
@@ -316,16 +291,17 @@ def get_footer_and_record_size(path: str) -> Tuple[int, int]:
                 footer_offset = file_size - offset + idx
                 footer = buffer[idx:].decode('utf-8', errors='replace').strip()
                 record_size = None
-                for field in footer.split('\t'):
-                    if field.startswith('record_size='):
-                        try:
-                            record_size = int(field.split('=', 1)[1])
-                        except ValueError:
-                            pass
-                        break
-                if record_size is None:
-                    raise ValueError('record_size key not found or invalid in footer')
-                return footer_offset, record_size
+                if fmt == 'binary':
+                    for field in footer.split('\t'):
+                        if field.startswith('record_size='):
+                            try:
+                                record_size = int(field.split('=', 1)[1])
+                            except ValueError:
+                                pass
+                            break
+                    if record_size is None:
+                        raise ValueError('record_size key not found or invalid in footer')
+                return footer, footer_offset, record_size
         raise ValueError('Footer marker not found')
 
 
@@ -334,11 +310,11 @@ def header_end_offset(path: str) -> int:
     Return the byte offset immediately after the first line (header).
     """
     with open(path, 'rb') as f:
-        first = f.readline()  # header line including newline
+        _ = f.readline()  # header line including newline
         return f.tell()
 
 
-def iter_text_records(path: str, first_tval: int, flowid: Optional[int]) -> Iterator[Record]:
+def iter_text_records(path: str, first_tval: int, flowid: int) -> Iterator[Record]:
     """
     Parse siftr2.5 text format where each body line is a CSV with 18 fields
     corresponding to struct pkt_node in C.
@@ -369,7 +345,7 @@ def iter_text_records(path: str, first_tval: int, flowid: Optional[int]) -> Iter
             except (ValueError, IndexError):
                 continue
 
-            if flowid is not None and fid != flowid:
+            if fid != flowid:
                 continue
             yield Record(
                 direction=direction,
@@ -394,12 +370,9 @@ def _unpack_pkt_node(chunk: bytes):
     )
 
 
-def iter_binary_records(path: str, first_tval: int, flowid: Optional[int]) -> Iterator[Record]:
+def iter_binary_records(path: str, first_tval: int, flowid: int, footer_offset: int, rec_size: int) -> Iterator[Record]:
     hdr_end = header_end_offset(path)
-    try:
-        footer_off, rec_size = get_footer_and_record_size(path)
-    except ValueError:
-        return
+
     if PKT_NODE_STRUCT.size != rec_size:
         raise ValueError(f"Configured struct size ({PKT_NODE_STRUCT.size}) != record_size ({rec_size})")
 
@@ -407,21 +380,20 @@ def iter_binary_records(path: str, first_tval: int, flowid: Optional[int]) -> It
         f.seek(hdr_end)
         while True:
             pos = f.tell()
-            if pos + rec_size > footer_off:
+            if pos + rec_size > footer_offset:
                 break
             chunk = f.read(rec_size)
             if len(chunk) < rec_size:
                 break
             try:
-                fid, direction, tval, snd_cwnd, snd_ssthresh, srtt, data_sz = _unpack_pkt_node(chunk)
+                fid, direction_int, tval, snd_cwnd, snd_ssthresh, srtt, data_sz = _unpack_pkt_node(chunk)
             except struct.error:
                 break
 
-            if flowid is not None and fid != flowid:
+            if fid != flowid:
                 continue
-            dir = 'i' if direction == 0 else 'o'
             yield Record(
-                direction=dir,
+                direction= 'i' if direction_int == 0 else 'o',
                 rel_time=tval - first_tval,
                 cwnd=snd_cwnd,
                 ssthresh=snd_ssthresh,
@@ -430,7 +402,7 @@ def iter_binary_records(path: str, first_tval: int, flowid: Optional[int]) -> It
             )
 
 
-def detect_first_tval(path: str, fmt: str) -> Optional[int]:
+def detect_first_tval(path: str, fmt: str, footer_offset: int, rec_size: int) -> Optional[int]:
     """Return the first record's tval (microseconds) or None if not found.
 
     For 'txt' format: the first record is the second line (after the header line),
@@ -464,12 +436,11 @@ def detect_first_tval(path: str, fmt: str) -> Optional[int]:
     elif fmt == 'binary':
         try:
             hdr_end = header_end_offset(path)
-            footer_off, rec_size = get_footer_and_record_size(path)
             if PKT_NODE_STRUCT.size != rec_size:
                 return None
             with open(path, 'rb') as f:
                 f.seek(hdr_end)
-                if hdr_end + rec_size > footer_off:
+                if hdr_end + rec_size > footer_offset:
                     return None
                 chunk = f.read(rec_size)
                 if len(chunk) < rec_size:
@@ -500,19 +471,20 @@ def main() -> int:
         print(output_line.rstrip('\n'))
 
     try:
-        fmt = detect_rec_fmt(args.file)
+        fmt = detect_rec_fmt(first_line)
     except ValueError as e:
         print(f"Error: {e}")
         return 1
 
-    first_tval = detect_first_tval(args.file, fmt)
+    last_line, footer_off, rec_size = get_last_line_offset_and_record_size(args.file, fmt)
+
+    first_tval = detect_first_tval(args.file, fmt, footer_off, rec_size)
     if first_tval is None:
         print(f"Error: first_tval is None")
         return 1
     elif args.verbose:
         print(f"first flow start at: {first_tval/1_000.0:.3f}")
 
-    last_line = read_last_line(args.file)
     if args.verbose:
         output_line = last_line.replace('\t', ', ')
         print()
@@ -562,7 +534,7 @@ def main() -> int:
                 break
 
         rec_iter = (
-            iter_binary_records(args.file, first_tval, flowid)
+            iter_binary_records(args.file, first_tval, flowid, footer_off, rec_size)
             if fmt == 'binary'
             else iter_text_records(args.file, first_tval, flowid)
         )
